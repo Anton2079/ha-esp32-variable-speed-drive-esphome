@@ -103,6 +103,31 @@ globals:
     restore_value: false
     initial_value: '0'
 
+  # Message health monitoring
+
+  - id: last_good_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: fail_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
+
+  - id: partial_count
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_partial_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+    
+
 # -------------------------------
 # Status / UI
 # -------------------------------
@@ -279,6 +304,49 @@ sensor:
     web_server:
       sorting_group_id: sorting_group_current_operations
 
+  # Message health monitoring
+
+  - platform: template
+    name: "Modbus Fail Count"
+    id: modbus_fail_count
+    unit_of_measurement: "x"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return id(fail_count);
+
+  - platform: template
+    name: "Last Good Age (s)"
+    id: last_good_age_s
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      if (id(last_good_ms) == 0) return 99999;
+      return (millis() - id(last_good_ms)) / 1000.0f;
+
+
+  - platform: template
+    name: "Partial Frame Count"
+    id: partial_frame_count
+    unit_of_measurement: "x"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return (float) id(partial_count);
+
+  - platform: template
+    name: "Last Partial Age (s)"
+    id: partial_age_s
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      if (id(last_partial_ms) == 0) return 0.0f;
+      return (millis() - id(last_partial_ms)) / 1000.0f;
+
+
+
 # =========================
 # Diagnostics
 # =========================
@@ -329,20 +397,12 @@ interval:
               return id(modbus_enabled);
           then:
             - lambda: |-
-                // Skip polling briefly after a write to avoid race conditions
+                // Skip briefly after a write to avoid race conditions
                 if ((millis() - id(last_write_ms)) < 600) {
-                  // Optional status hint:
-                  // id(modbus_status).publish_state("Write Pause");
                   return;
                 }
 
                 auto uart = id(modbus_uart);
-
-                // Clear stale bytes to avoid misaligned frames
-                while (uart->available() > 0) {
-                  uint8_t t;
-                  uart->read_array(&t, 1);
-                }
 
                 // Build READ packet AA C3 07 D1 00 00 <CRClo> <CRChi>
                 uint8_t req[6] = {0xAA, 0xC3, 0x07, 0xD1, 0x00, 0x00};
@@ -354,65 +414,170 @@ interval:
                     else { crc >>= 1; }
                   }
                 }
-                uint8_t packet[8] = {req[0], req[1], req[2], req[3], req[4], req[5],
-                                     (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF)};
+                uint8_t packet[8] = {
+                  req[0], req[1], req[2], req[3], req[4], req[5],
+                  (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF)
+                };
 
-                // Enable TX, send, then disable TX
+                // RS-485 DE/RE guard at 1200 bps (pre/post delays to avoid truncation)
                 id(modbus_write_enable).turn_on();
-                uart->write_array(packet, 8);
+                delay(4);  // pre-TX guard (was 3)
+                uart->write_array(packet, sizeof(packet));
                 uart->flush();
+                delay(8);  // post-TX guard (was 5)
                 id(modbus_write_enable).turn_off();
 
-                // Wait for at least 7 bytes (AA C3 00 00 01 RPM_HI RPM_LO) with longer timeout
+                // Rolling RX buffer across intervals (handles split/partial frames, trailing noise)
+                static uint8_t rx[64];
+                static size_t rx_len = 0;
+
+                // Collect response bytes for a short window
                 uint32_t start = millis();
-                while (uart->available() < 7 && (millis() - start) < 800) {
-                  delay(1);
+                while ((millis() - start) < 250) {
+                  while (uart->available() > 0 && rx_len < sizeof(rx)) {
+                    uart->read_array(&rx[rx_len], 1);
+                    rx_len++;
+                  }
+                  if (rx_len >= 7) break;  // minimum for header + RPM_HI + RPM_LO
+                  delay(2);
                 }
 
-                if (uart->available() >= 7) {
-                  // Read up to 32 bytes to allow resync past noise/FF
-                  uint8_t buf[32];
-                  size_t available = uart->available();
-                  if (available > sizeof(buf)) available = sizeof(buf);
-                  size_t n = available;
-                  uart->read_array(buf, n);
+                bool got_frame = false;
+                bool partial_frame = false;
 
-                  // Find a valid frame start: AA C3 00 00 01
-                  int si = -1;
-                  for (size_t i = 0; i + 6 < n; i++) {
-                    if (buf[i] == 0xAA && buf[i+1] == 0xC3 &&
-                        buf[i+2] == 0x00 && buf[i+3] == 0x00 && buf[i+4] == 0x01) {
-                      si = (int)i;
-                      break;
-                    }
+                // Find header AA C3 00 00 01
+                int si = -1;
+                for (size_t i = 0; i + 4 < rx_len; i++) {
+                  if (rx[i] == 0xAA && rx[i+1] == 0xC3 && rx[i+2] == 0x00 && rx[i+3] == 0x00 && rx[i+4] == 0x01) {
+                    si = (int)i;
+                    break;
                   }
+                }
 
-                  if (si >= 0 && (si + 6) < (int)n) {
-                    // Extract RPM from bytes [si+5]=HI, [si+6]=LO
-                    uint16_t raw = ((uint16_t)buf[si+5] << 8) | (uint16_t)buf[si+6];
+                if (si >= 0) {
+                  size_t bytes_after_hdr = rx_len - (si + 5);
+                  if (bytes_after_hdr >= 2) {
+                    // We have at least a 7-byte frame (header + RPM_HI + RPM_LO)
+                    uint16_t raw = ((uint16_t)rx[si+5] << 8) | (uint16_t)rx[si+6];
 
-                    // Sanity filter: accept only plausible RPM range
-                    if (raw > 500 && raw < 4000) {
-                      if (raw != (uint16_t)id(pump_rpm_state).state) {
-                        id(pump_rpm_state).publish_state(raw);
-                        id(pump_rpm).publish_state(raw);
+                    // CRC is OPTIONAL. If present and matching, consume 9; else accept 7 and ignore trailing noise.
+                    const bool crc_present = (rx_len >= (si + 9));
+                    bool crc_matches = false;
+                    if (crc_present) {
+                      uint16_t crc_calc = 0xFFFF;
+                      for (int k = si; k <= si + 6; k++) {
+                        crc_calc ^= rx[k];
+                        for (int j = 0; j < 8; j++) {
+                          if (crc_calc & 0x0001) { crc_calc >>= 1; crc_calc ^= 0xA001; }
+                          else { crc_calc >>= 1; }
+                        }
                       }
-                      id(modbus_status).publish_state("Online");
-                    } else {
-                      // Ignore spurious values (e.g., 1 or 265)
-                      // Optionally: id(modbus_status).publish_state("Spurious");
+                      uint16_t crc_rx = (uint16_t)rx[si+7] | ((uint16_t)rx[si+8] << 8);
+                      crc_matches = (crc_calc == crc_rx);
                     }
+
+                    // Choose how many bytes to consume from buffer
+                    size_t consume_len = crc_matches ? 9 : 7;
+
+                    // Tolerant RPM rules
+                    bool valid_value = false;
+                    uint16_t new_rpm = 0;
+                    if (raw <= 300) {
+                      new_rpm = 0;                  // stopped
+                      valid_value = true;
+                    } else if (raw >= 600 && raw <= 3500) {
+                      new_rpm = raw;                // valid running RPM
+                      valid_value = true;
+                    } else {
+                      valid_value = false;          // ignore out-of-range noise
+                    }
+
+                    if (valid_value) {
+                      if (new_rpm != (uint16_t)id(pump_rpm_state).state) {
+                        id(pump_rpm_state).publish_state(new_rpm);
+                        id(pump_rpm).publish_state(new_rpm);
+                      }
+                      if (id(modbus_status).state != "Online") {
+                        id(modbus_status).publish_state("Online");
+                      }
+                      id(last_good_ms) = millis();
+                      id(fail_count) = 0;
+                      got_frame = true;
+                    } else {
+                      // We still consider comms good. Keep RPM, keep status "Online".
+                      if (id(modbus_status).state != "Online") {
+                        id(modbus_status).publish_state("Online");
+                      }
+                      id(last_good_ms) = millis();
+                      id(fail_count) = 0;
+                      got_frame = true;
+                    }
+
+                    // Consume exactly 7 bytes if CRC absent/mismatched, else 9
+                    size_t consume = si + consume_len;
+                    if (consume > rx_len) consume = rx_len;
+                    size_t rem = rx_len - consume;
+                    if (rem > 0) {
+                      memmove(rx, rx + consume, rem);
+                    }
+                    rx_len = rem;
+
                   } else {
-                    // No valid header sequence found; ignore this batch
-                    // Optionally: id(modbus_status).publish_state("No Header");
+                    // Header found but incomplete: count partial, but do not change status or RPM
+                    partial_frame = true;
+                    id(partial_count) = id(partial_count) + 1;
+                    id(last_partial_ms) = millis();
+                    // Keep header in buffer for next tick (do not consume)
                   }
                 } else {
-                  id(modbus_status).publish_state("No Response");
+                  // No header visible; trim buffer if it grows with idle noise (e.g., long runs of 0xFF)
+                  if (rx_len >= sizeof(rx) / 2) {
+                    const size_t keep = 4;
+                    if (rx_len > keep) {
+                      memmove(rx, rx + (rx_len - keep), keep);
+                      rx_len = keep;
+                    }
+                  }
+                }
+
+                // Final decision: partials do NOT change status; only true misses increment fail_count
+                if (!got_frame) {
+                  if (partial_frame) {
+                    // Do nothing: keep status and RPM as-is. No fail_count++.
+                  } else {
+                    // True miss (no usable header/frame this cycle)
+                    id(fail_count) = id(fail_count) + 1;
+
+                    // If you want to avoid status churn, leave "No Response" suppressed here.
+                    // You can enable it only after >1 consecutive miss by uncommenting below.
+                    // bool was_online = (id(modbus_status).state == "Online");
+                    // if (!was_online || id(fail_count) > 1) {
+                    //   if (id(modbus_status).state != "No Response") {
+                    //     id(modbus_status).publish_state("No Response");
+                    //   }
+                    // }
+
+                    // Watchdog: 10 seconds since last good frame OR 10 true misses
+                    uint32_t now = millis();
+                    if (id(last_good_ms) != 0) {
+                      uint32_t age_ms = now - id(last_good_ms);
+                      if (age_ms > 10000 || id(fail_count) >= 10) {
+                        if (id(pump_rpm_state).state != 0) {
+                          id(pump_rpm_state).publish_state(0);
+                          id(pump_rpm).publish_state(0);
+                        }
+                        if (id(modbus_status).state != "Stale") {
+                          id(modbus_status).publish_state("Stale");
+                        }
+                      }
+                    }
+                  }
                 }
           else:
             - text_sensor.template.publish:
                 id: modbus_status
                 state: "Disabled"
+
 
   - interval: 1s
     then:
