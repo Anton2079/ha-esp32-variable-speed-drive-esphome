@@ -1,3 +1,8 @@
+substitutions:
+  # Flow rate at max RPM (2900), in litres per hour
+  max_flow_lph: "13800"
+  # Power consumption at max RPM (2900), in watts
+  max_power_w: "976"
 
 esphome:
   name: pool-pump
@@ -35,8 +40,8 @@ wifi:
   ap:
     ap_timeout: 1min
   networks:
-    - ssid: [REDACTED]
-      password: [REDACTED]
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
 
 # Optional Bluetooth disabled
 # esp32_ble_tracker:
@@ -48,13 +53,13 @@ captive_portal:
 web_server:
   port: 80
   version: 3
-  sorting_groups:  
-    - id: sorting_group_current_operations  
-      name: "Current Operations"  
+  sorting_groups:
+    - id: sorting_group_current_operations
+      name: "Current Operations"
       sorting_weight: 10
-    - id: sorting_group_diag  
-      name: "WiFi & System Info"  
-      sorting_weight: 40      
+    - id: sorting_group_diag
+      name: "WiFi & System Info"
+      sorting_weight: 40
 
 # -------------------------------
 # UART / RS-485
@@ -126,7 +131,7 @@ globals:
     restore_value: false
     initial_value: '0'
 
-    
+
 
 # -------------------------------
 # Status / UI
@@ -154,19 +159,19 @@ text_sensor:
   - platform: wifi_info
     ip_address:
       name: "IP Address"
-      web_server:  
+      web_server:
         sorting_group_id: sorting_group_diag
     ssid:
       name: "WiFi SSID"
-      web_server:  
+      web_server:
         sorting_group_id: sorting_group_diag
     bssid:
       name: "WiFi BSSID"
-      web_server:  
+      web_server:
         sorting_group_id: sorting_group_diag
     mac_address:
       name: "MAC Address"
-      web_server:  
+      web_server:
         sorting_group_id: sorting_group_diag
 
   - platform: template
@@ -190,13 +195,13 @@ text_sensor:
         snprintf(buffer, sizeof(buffer), "%u s", seconds);
       }
       return std::string(buffer);
-    web_server:  
+    web_server:
       sorting_group_id: sorting_group_diag
 
   - platform: version
     name: "ESPHome Version"
-    web_server:  
-      sorting_group_id: sorting_group_diag            
+    web_server:
+      sorting_group_id: sorting_group_diag
 
 number:
   - platform: template
@@ -256,7 +261,7 @@ sensor:
     update_interval: never
     force_update: false
 
-  # Empirical best-fit power from RPM (forced to 976 W @ 2900 RPM)
+  # Empirical best-fit power from RPM (forced through max_power_w @ 2900 RPM)
   - platform: template
     name: "Pump Power (W)"
     id: pump_power_w
@@ -269,13 +274,14 @@ sensor:
     lambda: |-
       float rpm = id(pump_rpm_state).state;
       if (rpm <= 0.0f) return 0.0f;
-      const float k = 5.75672131e-07f;   // global best-fit, forced through 2900 RPM = 976 W
       const float b = 2.665573f;
+      // k = max_power_w / 2900^b
+      const float k = ${max_power_w} / powf(2900.0f, b);
       return k * powf(rpm, b);
     web_server:
       sorting_group_id: sorting_group_current_operations
 
-  # Flow is approximately linear with RPM (reference: 230 L/min @ 2900 RPM)
+  # Flow is approximately linear with RPM (reference: max_flow_lph @ 2900 RPM)
   - platform: template
     name: "Pump Flow (L/min)"
     id: pump_flow_lmin
@@ -286,7 +292,7 @@ sensor:
     lambda: |-
       float rpm = id(pump_rpm_state).state;
       if (rpm <= 0.0f) return 0.0f;
-      return 230.0f * (rpm / 2900.0f);
+      return (${max_flow_lph} / 60.0f) * (rpm / 2900.0f);
     web_server:
       sorting_group_id: sorting_group_current_operations
 
@@ -354,12 +360,12 @@ sensor:
     name: "WiFi Signal (dB)"
     id: wifi_rssi_db
     update_interval: 30s
-    web_server:  
+    web_server:
       sorting_group_id: sorting_group_diag
 
-  - platform: internal_temperature  
-    name: "ESP Internal Temperature" 
-    web_server:  
+  - platform: internal_temperature
+    name: "ESP Internal Temperature"
+    web_server:
       sorting_group_id: sorting_group_diag
 
   - platform: template
@@ -375,15 +381,15 @@ sensor:
       return pct;
     unit_of_measurement: "%"
     icon: "mdi:wifi"
-    web_server:  
+    web_server:
       sorting_group_id: sorting_group_diag
 
   - platform: uptime
     name: "Uptime (s)"
     id: uptime_s
-    update_interval: 30s      
-    web_server:  
-      sorting_group_id: sorting_group_diag    
+    update_interval: 30s
+    web_server:
+      sorting_group_id: sorting_group_diag
 
 # -------------------------------
 # Poll loop (guarded by modbus_enabled, validated frame)
@@ -695,20 +701,20 @@ button:
   - platform: restart
     name: "Restart ESP32"
     id: restart_button
-    web_server:  
+    web_server:
       sorting_group_id: sorting_group_diag
 
   - platform: safe_mode
     name: "Boot to Safe Mode"
     id: safe_mode_button
-    web_server:  
-      sorting_group_id: sorting_group_diag            
+    web_server:
+      sorting_group_id: sorting_group_diag
 
 binary_sensor:
-  - platform: status  
-    name: "ESP32 Status"  
-    device_class: connectivity  
-    web_server:  
+  - platform: status
+    name: "ESP32 Status"
+    device_class: connectivity
+    web_server:
       sorting_group_id: sorting_group_diag
 
   - platform: template
